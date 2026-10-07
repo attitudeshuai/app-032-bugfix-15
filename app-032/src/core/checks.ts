@@ -7,7 +7,8 @@ import { bodySurfaceArea, polygonEdge, ringPerimeter, segmentInfos } from './geo
 import { buildFrame, type FrameResult } from './frame'
 import { buildPanels, panelNetArea, type PanelResult } from './panels'
 import { computeBatch, computeMaterials, type BatchMaterials, type SingleLightMaterials } from './materials'
-import { assertNoPanelSplit, paginate, type LoftOptions, type Sheet } from './paginate'
+import { assertNoPanelSplit, assertStripsContinuous, paginate, PAPER_DIMS, type LoftOptions, type Sheet } from './paginate'
+import { buildLabels } from './labels'
 import { CRAFT } from './craft'
 
 export interface FullResult {
@@ -31,7 +32,7 @@ export function computeAll(l: Lantern, loft: LoftOptions): FullResult {
   const batch = computeBatch(materials, Math.max(1, Math.round(l.batchCount)), l.wasteRatio)
   const sheets = paginate(l, loft)
   const elapsedMs = performance.now() - t0
-  const checks = runChecks(l, frame, panels, materials, batch, sheets, elapsedMs)
+  const checks = runChecks(l, frame, panels, materials, batch, sheets, elapsedMs, loft)
   return { frame, panels, materials, batch, sheets, checks, elapsedMs }
 }
 
@@ -42,7 +43,8 @@ function runChecks(
   materials: SingleLightMaterials,
   batch: BatchMaterials,
   sheets: Sheet[],
-  elapsedMs: number
+  elapsedMs: number,
+  loft: LoftOptions
 ): CheckResult[] {
   const out: CheckResult[] = []
   const g = frame.geometry
@@ -147,15 +149,20 @@ function runChecks(
     })
   }
 
-  // ---- CHK-06 分页：裁片不跨页 ----
+  // ---- CHK-06 分页：裁片不跨页 + 长条分段连续 ----
   {
     const r = assertNoPanelSplit(sheets)
+    const st = assertStripsContinuous(l, loft, sheets)
+    const pass = r.pass && st.pass
     out.push({
       id: 'CHK-06',
-      title: '分页：任一裁片不跨页（长条跨页带对位十字与搭接量）',
-      pass: r.pass,
-      value: r.pass ? '通过' : '失败',
-      detail: `${r.detail}；跨页仅出现在骨架长条上，接缝处绘制对位十字并标注搭接 ${f1(loftOverlap(sheets))}mm 与拼接编号`
+      title: '分页：裁片不跨页不缩放；长条按搭接量连续可拼、段编号接续',
+      pass,
+      value: pass ? '通过' : '失败',
+      detail:
+        `裁片：${r.detail}。` +
+        `长条：${st.detail}。` +
+        (r.oversize ? '（超大裁片只能换更大幅面，不允许切开或缩放）' : '')
     })
   }
 
@@ -176,6 +183,73 @@ function runChecks(
       pass,
       value: `竹篾 ${f3(batch.frameM)}m / 蒙面 ${f3(batch.coveringM2)}m²`,
       detail: `单灯竹篾 ${f3(materials.frameM)}m × ${n} × ${(1 + l.wasteRatio).toFixed(2)} = ${f3(materials.frameM * k)}m = 批量值；蒙面、扎线、胶同理（LED 按颗数 × ${n} 计，不参与损耗）`
+    })
+  }
+
+  // ---- CHK-09 编号对账：图纸 / 标签 / 裁片清单 / 构件清单同一套编号 ----
+  {
+    const problems: string[] = []
+
+    // ① 图纸上的裁片编号 ↔ 裁片清单：每种裁片在图纸上恰好 1 次
+    const panelIds = new Set(panels.panels.map((p) => p.id))
+    const onSheets = new Map<string, number>()
+    let paperOk = true
+    for (const s of sheets) {
+      if (s.wMm !== PAPER_DIMS[loft.paper].wMm || s.hMm !== PAPER_DIMS[loft.paper].hMm) paperOk = false
+      for (const it of s.items) {
+        if (it.type !== 'panel') continue
+        onSheets.set(it.panel.id, (onSheets.get(it.panel.id) || 0) + 1)
+        if (!panelIds.has(it.panel.id)) problems.push(`图纸出现清单里没有的裁片 ${it.panel.id}`)
+      }
+    }
+    for (const id of panelIds) {
+      const n = onSheets.get(id) || 0
+      if (n !== 1) problems.push(`裁片 ${id} 在图纸上出现 ${n} 次（应 1 次）`)
+    }
+    if (!paperOk) problems.push(`图纸幅面未按 ${loft.paper} 重算`)
+
+    // ② 标签：每块裁片一张，编号唯一且落在裁片清单内，总数 = 裁片总块数
+    const labels = buildLabels(l)
+    if (labels.length !== panels.totalQty) {
+      problems.push(`标签 ${labels.length} 张 ≠ 裁片总块数 ${panels.totalQty}`)
+    }
+    const codes = new Set<string>()
+    for (const e of labels) {
+      if (!panelIds.has(e.panelId)) problems.push(`标签编号 ${e.code} 在裁片清单中不存在`)
+      if (codes.has(e.code)) problems.push(`标签编号重复 ${e.code}`)
+      codes.add(e.code)
+      if (e.piece < 1 || e.piece > e.pieceOf) problems.push(`标签 ${e.code} 块号越界`)
+    }
+    // 全局连续块号 1..N，一张不缺
+    if (labels.some((e, i) => e.seq !== i + 1)) problems.push('标签连续块号断号')
+
+    // ③ 长条拼接编号 ↔ 构件清单：每张图纸上的长条都属于清单中的构件，且段数齐全
+    const memberIds = new Set(frame.members.map((m) => m.id))
+    const stripTags = new Set<string>()
+    for (const s of sheets) {
+      for (const it of s.items) {
+        if (it.type !== 'strip') continue
+        if (!memberIds.has(it.member.id)) problems.push(`图纸出现清单里没有的构件 ${it.member.id}`)
+        if (stripTags.has(it.tag)) problems.push(`长条拼接编号重复 ${it.tag}`)
+        stripTags.add(it.tag)
+      }
+    }
+    const st = assertStripsContinuous(l, loft, sheets)
+    if (!st.pass) problems.push('长条段编号与构件清单接不上（详见 CHK-06）')
+
+    out.push({
+      id: 'CHK-09',
+      title: '编号对账：图纸裁片/长条段编号 · 标签块数 · 裁片清单 · 构件清单 完全一致',
+      pass: problems.length === 0,
+      value:
+        problems.length === 0
+          ? `裁片 ${panels.panels.length} 种 / ${panels.totalQty} 块 · 标签 ${labels.length} 张 · 长条 ${st.segCount} 段，四处对得上`
+          : `${problems.length} 处对不上`,
+      detail:
+        problems.length === 0
+          ? `图纸上 ${panels.panels.length} 种裁片编号与裁片清单一致且各出现 1 次；标签 ${labels.length} 张（每 10 张一页）编号 ${labels[0]?.code ?? '—'} … ${labels[labels.length - 1]?.code ?? '—'} 无重复无断号；` +
+            `骨架长条 ${st.memberCount} 根、${st.segCount} 段的拼接编号与构件清单 FM 编号一一对应；改纸张幅面（${loft.paper}）或搭接量（${f1(loft.overlapMm)}mm）后四处同步刷新`
+          : problems.slice(0, 5).join('；') + (problems.length > 5 ? ` 等 ${problems.length} 处` : '')
     })
   }
 
@@ -204,16 +278,7 @@ function suggestDivisions(l: Lantern, netArea: number, ratio: number): number | 
   return CRAFT.divMax
 }
 
-function loftOverlap(sheets: Sheet[]): number {
-  for (const s of sheets) {
-    for (const it of s.items) {
-      if (it.type === 'strip' && it.overlapMm > 0) return it.overlapMm
-    }
-  }
-  return 0
-}
-
-/** 校验尺标称长度（mm）：1:1 打印用 */
+/** 校验尺标称长度（mm）：1:1 打印用，必须按标称长度绘制 */
 export const CALIBRATION_RULER_MM = 100
 export const CALIBRATION_CIRCLE_MM = 100
 

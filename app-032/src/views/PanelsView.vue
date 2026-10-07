@@ -79,6 +79,7 @@ function exportCsv() {
         <header>
           <h3>
             <span class="dot" :style="{ background: p.color }" />
+            <span class="pid">{{ p.id }}</span>
             {{ p.label }}
           </h3>
           <span class="qty">× {{ p.qty }} 块</span>
@@ -146,9 +147,9 @@ function exportCsv() {
     </section>
 
     <ChecksPanel
-      :checks="full.checks.filter((c) => ['CHK-03', 'CHK-05', 'CHK-06'].includes(c.id))"
+      :checks="full.checks.filter((c) => ['CHK-03', 'CHK-05', 'CHK-06', 'CHK-09'].includes(c.id))"
       :elapsed-ms="full.elapsedMs"
-      title="裁片与分页自检"
+      title="裁片、分页与编号对账自检"
     />
   </div>
 </template>
@@ -280,6 +281,14 @@ button.primary:hover {
   height: 12px;
   border-radius: 3px;
   border: 1px solid var(--line-strong);
+}
+
+.pid {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: #8f1c19;
+  margin-right: 4px;
 }
 
 .qty {
