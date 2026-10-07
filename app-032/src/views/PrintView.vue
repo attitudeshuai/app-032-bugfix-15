@@ -2,9 +2,11 @@
 /**
  * 1:1 放样图（分页与拼接标记）· 规格书 §4.5 / §4.7 / §8 / §9
  * - SVG 以毫米为绘图单位（viewBox 1 单位 = 1mm），width/height 用 mm，1:1 输出；
- * - 同一块裁片不拆到两页（由 paginate 保证，并在页面展示断言结果）；
- * - 骨架长条跨页处绘制对位十字、拼接编号与搭接量；
- * - 附 100mm 校验尺与 Ø100 校验圆，并显式提示「请关闭『适应页面』并按 100% 打印」。
+ * - 同一块裁片不拆到两页、不缩放（由 paginate 保证，CHK-06 报红可一眼看出）；
+ * - 骨架长条跨页按真实搭接量重叠排布，对位十字 + 连续拼接编号（F001-1/3…）；
+ * - 附 100mm 校验尺与 Ø100 校验圆；@page 尺寸随所选 A4/A3 动态注入，
+ *   并显式提示「请关闭『适应页面』并按 100% 打印」；
+ * - 图纸页 / 标签页 / 构件清单页顶部显示同一份「编号对账单」（CHK-09）。
  */
 import { computed, onUnmounted, reactive, watch, watchEffect } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -15,6 +17,11 @@ import {
   DEFAULT_LOFT_OPTIONS,
   PAPER_DIMS,
   assertNoPanelSplit,
+  paginateLabels,
+  PANEL_PAD_TOP,
+  LABELS_PER_PAGE,
+  stripUsableMm,
+  effectiveOverlap,
   type LoftOptions,
   type SheetItem,
   type SheetItemPanel,
@@ -23,6 +30,7 @@ import {
 import { groupMembers } from '../core/frame'
 import { kindName, shapeName } from '../core/exporter'
 import { coveringLabel, kindLabel, styleLabel } from '../core/craft'
+import { panelCutBounds } from '../core/panels'
 import type { Panel } from '../core/types'
 
 type PrintMode = 'loft' | 'frame' | 'labels'
@@ -69,7 +77,8 @@ const sheets = computed(() => full.value?.sheets ?? [])
 const splitCheck = computed(() => assertNoPanelSplit(sheets.value))
 const frameGroups = computed(() => (full.value ? groupMembers(full.value.frame.members) : []))
 
-const pageDims = computed(() => (mode.value === 'loft' ? PAPER_DIMS[opts.paper] : PAPER_DIMS.A4))
+/** 三种打印模式统一用所选幅面（构件清单 / 标签页也按 A4/A3 出） */
+const pageDims = computed(() => PAPER_DIMS[opts.paper])
 
 const coverDims = computed(() => {
   const g = full.value?.frame.geometry
@@ -78,25 +87,33 @@ const coverDims = computed(() => {
   return { topMm: s[s.length - 1].radiusMm * 2, botMm: s[0].radiusMm * 2 }
 })
 
-/** 动态注入 @page 尺寸，保证 1:1（含 A3 横向页面尺寸） */
+/** 动态注入 @page 尺寸：换 A4/A3 后必须按新幅面毫米数重算，否则打印机仍按旧纸宽裁掉右边 */
 watchEffect(() => {
-  void pageDims.value
+  const d = pageDims.value
   let el = document.getElementById('loft-page-style') as HTMLStyleElement | null
   if (!el) {
     el = document.createElement('style')
     el.id = 'loft-page-style'
     document.head.appendChild(el)
   }
-  el.textContent = '@page { size: 210mm 297mm; margin: 0; }'
+  el.textContent = `@page { size: ${d.wMm}mm ${d.hMm}mm; margin: 0; }`
 })
 
 onUnmounted(() => {
   document.getElementById('loft-page-style')?.remove()
 })
 
-const labelPages = computed(() => {
-  const list = full.value?.panels.panels ?? []
-  return [list.slice(0, 10)]
+/** 裁片标签：每张裁片类型一张，每 10 张一页，多出来的自动续页，一张都不许漏 */
+const allPanels = computed(() => full.value?.panels.panels ?? [])
+const labelPages = computed(() => paginateLabels(allPanels.value))
+
+/** 标签网格随纸张幅面放大（A3 更宽更高），始终 2 列 × 5 行 = 每页 10 张 */
+const labelGridStyle = computed(() => {
+  const d = pageDims.value
+  const padMm = d.wMm >= 297 ? 14 : 10
+  const colW = (d.wMm - padMm * 2 - 4) / 2
+  const rowH = d.hMm >= 400 ? 68 : 50
+  return { gridTemplateColumns: `repeat(2, ${colW.toFixed(1)}mm)`, gridAutoRows: `${rowH}mm` }
 })
 
 function setMode(m: PrintMode) {
@@ -110,16 +127,15 @@ function doPrint() {
 const asPanel = (it: SheetItem): SheetItemPanel => it as SheetItemPanel
 const asStrip = (it: SheetItem): SheetItemStrip => it as SheetItemStrip
 
-const PANEL_PAD_LEFT = 4
-const PANEL_PAD_TOP = 8
-
 function panelBox(it: SheetItemPanel) {
   const p = it.panel
+  const b = panelCutBounds(p)
+  // 在占位框内水平居中（梯形上下宽不同、多边形顶点外扩时也不会越过占位框被切边）
   return {
-    x: it.xMm + PANEL_PAD_LEFT,
+    x: it.xMm + (it.wMm - b.w) / 2,
     y: it.yMm + PANEL_PAD_TOP,
-    w: Math.max(p.widthTopMm, p.widthBottomMm),
-    h: p.heightMm
+    w: b.w,
+    h: b.h
   }
 }
 
@@ -163,11 +179,14 @@ function netPoints(p: Panel, w: number, h: number): string {
 
 function markList(it: SheetItemPanel) {
   const b = panelBox(it)
-  return (it.panel.marksMm || []).map((m, i) => ({
+  const p = it.panel
+  // 正多边形盖片：标记按对边距建立坐标，而绘制外接框更宽，需补居中偏移
+  const off = p.shape === 'circle' && p.polySides ? (b.w - p.widthTopMm) / 2 : 0
+  return (p.marksMm || []).map((m, i) => ({
     n: i + 1,
     label: m.label,
-    cx: b.x + m.x,
-    cy: b.y + (b.h - m.y)
+    cx: b.x + off + m.x,
+    cy: b.y + (b.h - m.y) - off
   }))
 }
 
@@ -187,16 +206,36 @@ function stripText(it: SheetItemStrip): string {
   const kind = kindName(m.kind)
   const name = m.label.includes(kind) ? m.label : `${m.label}（${kind}）`
   const parts = [
-    `[${it.tag}] ${name}`,
+    `[${it.tag}] ${m.id} ${name}`,
     `全长 ${f1(it.totalMm)}mm`,
-    `本段 ${f1(it.lengthMm)}mm（整根第 ${f1(it.startMm)}–${f1(it.startMm + it.lengthMm)}mm）`
+    `本段 ${f1(it.lengthMm)}mm（整根标尺 ${f1(it.startMm)}–${f1(it.startMm + it.lengthMm)}mm，第 ${it.segIndex + 1}/${it.segCount} 段）`
   ]
   if (it.overlapMm > 0) {
     const mates = [it.prevTag, it.nextTag].filter(Boolean).join(' / ')
-    parts.push(`与 ${mates} 搭接 ${f1(it.overlapMm)}mm`)
+    parts.push(`与相邻段 ${mates} 真实搭接 ${f1(it.overlapMm)}mm（两端标尺读数连续，按对位十字粘接）`)
   }
   return parts.join(' · ')
 }
+
+/** 构件 → 长条分段数（构件清单里展示其图纸拼接编号范围） */
+const memberSegCount = computed(() => {
+  const map = new Map<string, number>()
+  for (const s of sheets.value) {
+    for (const it of s.items) {
+      if (it.type === 'strip') map.set(it.member.id, it.segCount)
+    }
+  }
+  return map
+})
+
+/** 当前纸张下单段可用宽与建议搭接（搭接量必须小于段宽） */
+const stripGeom = computed(() => {
+  const s0 = sheets.value[0]
+  const usable = s0 ? stripUsableMm(s0.contentWMm) : 0
+  const want = Math.max(0, opts.overlapMm)
+  const eff = effectiveOverlap(want, usable)
+  return { usable, eff, clamped: usable > 0 && want > eff + 0.001 }
+})
 
 function sheetFoot(s: { index: number }) {
   return `第 ${s.index}/${sheets.value.length} 页 · 请按 100% 打印（关闭「适应页面」）· 校验尺见第 1 页`
@@ -255,17 +294,55 @@ function today(): string {
 
       <p v-if="mode === 'loft'" class="warn">
         ⚠ 请在打印对话框里把缩放设为 <b>100%</b>（关闭「适应页面 / Fit to page」），纸张选
-        {{ opts.paper }}，页边距选「无」；打印后先用第 1 页的 100mm 校验尺核对，误差应 ≤ 1mm。
+        <b>{{ opts.paper }}（{{ pageDims.wMm }}×{{ pageDims.hMm }}mm）</b>，页边距选「无」；
+        换纸张后图纸宽高、可打印区、分页已按新幅面毫米数全部重算。打印后先用第 1 页的 100mm 校验尺核对，
+        <b>实测必须 = 100.0mm</b>（若量出 96mm 一类，说明仍是「适应页面」缩放）。
       </p>
+
+      <!-- 编号对账单：图纸页 / 标签页 / 构件清单同一份结论 -->
+      <section class="reconcile" :class="{ bad: !full.reconcile.pass }">
+        <header>
+          <h3>编号对账单（图纸 · 标签 · 裁片清单 · 构件清单 同一份结论）</h3>
+          <span class="pill" :class="full.reconcile.pass ? 'ok' : 'bad'">
+            {{ full.reconcile.pass ? '全部对得上' : `${full.reconcile.problems.length} 处对不上` }}
+          </span>
+        </header>
+        <div class="rec-grid">
+          <div><span>纸张幅面</span><b>{{ full.reconcile.paper }}（{{ pageDims.wMm }}×{{ pageDims.hMm }}mm）</b></div>
+          <div><span>长条搭接量</span><b>{{ f1(full.reconcile.overlapMm) }}mm{{ stripGeom.clamped ? `（超过段宽，已夹为 ${f1(stripGeom.eff)}mm）` : '' }}</b></div>
+          <div><span>裁片清单</span><b>{{ full.reconcile.panelKinds }} 种 / {{ full.reconcile.panelQty }} 块</b></div>
+          <div><span>1:1 图纸裁片</span><b :class="{ bad: full.reconcile.sheetPanelKinds !== full.reconcile.panelKinds }">{{ full.reconcile.sheetPanelKinds }} 块（每种 1 块 1:1 样）</b></div>
+          <div><span>裁片标签</span><b :class="{ bad: full.reconcile.labelCards !== full.reconcile.panelKinds }">{{ full.reconcile.labelCards }} 张 / {{ full.reconcile.labelPages }} 页（每 {{ LABELS_PER_PAGE }} 张一页）</b></div>
+          <div><span>构件清单长条</span><b>{{ full.reconcile.stripKinds }} 种 → 图纸 {{ full.reconcile.stripSegTotal }} 段（跨页 {{ full.reconcile.stripSplitKinds }} 种）</b></div>
+          <div><span>图纸总页数</span><b>{{ full.reconcile.sheetPages }} 页（含 1 张校验页）</b></div>
+        </div>
+        <ul v-if="!full.reconcile.pass" class="rec-problems">
+          <li v-for="(p, i) in full.reconcile.problems" :key="i">✗ {{ p }}</li>
+        </ul>
+        <p v-else class="rec-ok">
+          ✓ 裁片编号在裁片清单 / 1:1 图纸 / 标签页三处一一对得上；长条拼接编号（FM###-i/n）与构件清单同号、按构件一顺接下去；
+          改纸张幅面或搭接量后本单随图纸整体刷新。
+        </p>
+      </section>
 
       <section v-if="mode === 'loft'" class="summary">
         <div class="stat"><span>图纸页数</span><b>{{ sheets.length }} 页</b></div>
         <div class="stat"><span>裁片类型</span><b>{{ full.panels.panels.length }} 种 / {{ full.panels.totalQty }} 块</b></div>
         <div class="stat"><span>裁片不跨页断言</span><b :class="splitCheck.pass ? 'ok' : 'bad'">{{ splitCheck.pass ? '通过' : '失败' }}</b></div>
-        <div class="stat"><span>超区整块输出</span><b>{{ splitCheck.overflow }} 块</b></div>
+        <div class="stat"><span>整块超区（未拆未缩）</span><b :class="splitCheck.overflow ? 'bad' : ''">{{ splitCheck.overflow }} 块</b></div>
+        <div class="stat"><span>单段可用宽 / 搭接</span><b>{{ f1(stripGeom.usable) }} / {{ f1(stripGeom.eff) }} mm</b></div>
         <div class="stat"><span>底盖净直径</span><b>{{ f1(coverDims.botMm) }} mm</b></div>
       </section>
       <p v-if="mode === 'loft'" class="sub detail">{{ splitCheck.detail }}</p>
+
+      <p v-if="mode === 'labels'" class="sub detail">
+        共 {{ allPanels.length }} 张标签，每 {{ LABELS_PER_PAGE }} 张一页，共 {{ labelPages.length }} 页；
+        编号与裁片清单、1:1 图纸逐张一致。打印纸张随上方「纸张」选择（当前 {{ opts.paper }}）。
+      </p>
+      <p v-if="mode === 'frame'" class="sub detail">
+        构件编号 FM### 与 1:1 图纸长条拼接编号 F### 同源（F### 即构件号）；跨页构件在「图纸段数」列标明 i/n。
+        打印纸张随上方「纸张」选择（当前 {{ opts.paper }}）。
+      </p>
     </section>
 
     <!-- ============ 1:1 放样图纸 ============ -->
@@ -384,12 +461,16 @@ function today(): string {
                 在「蒙面裁片 1:1」页按同一比例绘制，可实测对照（误差 ≤ 1mm）。
               </text>
               <text class="cal-note" :x="it.xMm" :y="it.yMm + 210">
-                ⑤ 同一块裁片不拆到两页；骨架长条跨页处带对位十字、拼接编号与搭接量（默认
-                {{ f1(opts.overlapMm) }}mm），请按编号粘接。
+                ⑤ 同一块裁片不拆页、不缩放（放不下整块单独一页居中，宁可费纸）；骨架长条相邻段按
+                {{ f1(opts.overlapMm) }}mm 真实重叠排布（宁可多占纸），段段标尺读数连续、编号 FM###-i/n 相接，请按对位十字粘接。
               </text>
               <text class="cal-note" :x="it.xMm" :y="it.yMm + 220">
-                ⑥ 导出 PDF：在打印对话框选择「另存为 PDF」，尺寸与打印完全一致（本页已按 {{ opts.paper }}
-                设置 @page 尺寸）。
+                ⑥ 本页 @page 已按 {{ opts.paper }}（{{ s.wMm }}×{{ s.hMm }}mm）设置；
+                若切换纸张，图纸宽高 / 可打印区 / 分页 / 长条分段全部按新幅面重算。导出 PDF 选「另存为 PDF」即可。
+              </text>
+              <text class="cal-note" :x="it.xMm" :y="it.yMm + 230">
+                ⑦ 打印后逐项核对：水平尺 = 垂直尺 = 100.0mm、圆直径 = 100.0mm；若量得 96mm 等数值，
+                说明打印对话框仍是「适应页面 / Fit」或纸张选错（当前应为 {{ opts.paper }}），请改正后重打。
               </text>
               <text class="cal-foot" :x="it.xMm" :y="it.yMm + it.hMm - 2">
                 {{ lantern.name }} · 1:1 校验页 · {{ today() }}
@@ -509,7 +590,7 @@ function today(): string {
               </g>
             </g>
 
-            <!-- 骨架长条 1:1（跨页带对位十字与搭接量） -->
+            <!-- 骨架长条 1:1（跨页带对位十字与真实搭接） -->
             <g v-else>
               <text class="strip-cap" :x="asStrip(it).xMm" :y="asStrip(it).yMm + 3.6">
                 {{ stripText(asStrip(it)) }}
@@ -521,19 +602,30 @@ function today(): string {
                 :width="asStrip(it).lengthMm"
                 height="4"
               />
+              <!-- 与上段的真实重叠区（阴影）：此区间与上一段末尾同一标尺读数，粘接时对准 -->
+              <rect
+                v-if="asStrip(it).segIndex > 0"
+                class="strip-overlap"
+                :x="asStrip(it).xMm"
+                :y="asStrip(it).yMm + 5"
+                :width="Math.min(asStrip(it).overlapMm, asStrip(it).lengthMm)"
+                height="4"
+              />
               <g v-for="t in stripTicks(asStrip(it))" :key="'t' + t.x">
                 <line class="strip-tick" :x1="t.x" :x2="t.x" :y1="asStrip(it).yMm + 9" :y2="asStrip(it).yMm + (t.major ? 11.8 : 10.8)" />
                 <text v-if="t.label" class="strip-tick-label" :x="t.x" :y="asStrip(it).yMm + 15" text-anchor="middle">
                   {{ t.label }}
                 </text>
               </g>
+              <!-- 段首对位十字：与上一段段尾同标尺读数（startMm） -->
               <g class="join" v-if="asStrip(it).segIndex > 0">
                 <line :x1="asStrip(it).xMm - 4" :x2="asStrip(it).xMm + 4" :y1="asStrip(it).yMm + 7" :y2="asStrip(it).yMm + 7" />
                 <line :x1="asStrip(it).xMm" :x2="asStrip(it).xMm" :y1="asStrip(it).yMm + 3" :y2="asStrip(it).yMm + 11" />
                 <text class="join-text" :x="asStrip(it).xMm" :y="asStrip(it).yMm + 2.6" text-anchor="middle">
-                  接 {{ asStrip(it).prevTag }} 搭接 {{ f1(asStrip(it).overlapMm) }}mm
+                  ↑ 接 {{ asStrip(it).prevTag }}：对准读数 {{ f1(asStrip(it).startMm) }}，搭接 {{ f1(asStrip(it).overlapMm) }}mm
                 </text>
               </g>
+              <!-- 段尾对位十字：下一段将从读数 (start+len-overlap) 接上 -->
               <g class="join" v-if="asStrip(it).nextTag">
                 <line
                   :x1="asStrip(it).xMm + asStrip(it).lengthMm - 4"
@@ -553,7 +645,7 @@ function today(): string {
                   :y="asStrip(it).yMm + 2.6"
                   text-anchor="middle"
                 >
-                  续 {{ asStrip(it).nextTag }}
+                  续 {{ asStrip(it).nextTag }} ↓
                 </text>
               </g>
             </g>
@@ -567,18 +659,23 @@ function today(): string {
     </div>
 
     <!-- ============ 构件清单（可打印） ============ -->
-    <section v-else-if="mode === 'frame'" class="doc">
+    <section
+      v-else-if="mode === 'frame'"
+      class="doc"
+      :style="{ width: pageDims.wMm + 'mm', minHeight: pageDims.hMm + 'mm' }"
+    >
       <h1>骨架构件清单</h1>
       <p class="doc-meta">
         灯样：{{ lantern.name }}（{{ kindLabel(lantern.kind) }}）· 最大直径 {{ lantern.maxDiameterMm }}mm · 总高
         {{ lantern.totalHeightMm }}mm · {{ lantern.layers.length }} 层 · {{ lantern.sides }} 棱 ·
         收口 {{ styleLabel(lantern.mouthStyle) }}/{{ styleLabel(lantern.bottomStyle) }} ·
         每端绑扎余量 {{ lantern.lashAllowanceMm }}mm · 蒙面 {{ coveringLabel(lantern.covering) }} ·
-        打印日期 {{ today() }}
+        纸张 {{ opts.paper }}（{{ pageDims.wMm }}×{{ pageDims.hMm }}mm）· 打印日期 {{ today() }}
       </p>
       <table class="doc-table">
         <thead>
           <tr>
+            <th>构件编号</th>
             <th>构件名称</th>
             <th>类别</th>
             <th>分组</th>
@@ -588,14 +685,16 @@ function today(): string {
             <th class="num">数量</th>
             <th class="num">总截取长 (mm)</th>
             <th>弯曲半径 / 折角</th>
+            <th class="num">图纸长条段数</th>
           </tr>
         </thead>
         <tbody>
           <template v-for="grp in frameGroups" :key="grp.group">
             <tr class="doc-group">
-              <td colspan="9">{{ grp.group }}</td>
+              <td colspan="11">{{ grp.group }}</td>
             </tr>
             <tr v-for="m in grp.items" :key="m.id">
+              <td class="mono strong">{{ m.id }}</td>
               <td>{{ m.label }}</td>
               <td>{{ kindName(m.kind) }}</td>
               <td>{{ m.group }}</td>
@@ -605,6 +704,12 @@ function today(): string {
               <td class="num mono">{{ m.qty }}</td>
               <td class="num mono">{{ f1(m.lengthMm * m.qty) }}</td>
               <td class="mono">{{ m.bendRadiusMm ? `R${f1(m.bendRadiusMm)}mm` : m.bendAngleDeg ? `${f1(m.bendAngleDeg)}°` : '—' }}</td>
+              <td class="num mono">
+                <template v-if="memberSegCount.get(m.id) && memberSegCount.get(m.id)! > 1">
+                  {{ memberSegCount.get(m.id) }} 段（{{ m.id }}-1/{{ memberSegCount.get(m.id) }}…）
+                </template>
+                <template v-else>1</template>
+              </td>
             </tr>
           </template>
         </tbody>
@@ -612,13 +717,24 @@ function today(): string {
       <p class="doc-foot">
         合计：构件 {{ full.frame.totalQty }} 根 · 备料（含余量）{{ (full.frame.stockLengthMm / 1000).toFixed(3) }}m ·
         净长 {{ (full.frame.rawLengthMm / 1000).toFixed(3) }}m · 绑扎余量合计
-        {{ f1(full.frame.lashExtraMm) }}mm
+        {{ f1(full.frame.lashExtraMm) }}mm ｜ 图纸长条共 {{ full.reconcile.stripSegTotal }} 段，
+        拼接编号与本清单构件编号同号（{{ opts.paper }}，搭接 {{ f1(opts.overlapMm) }}mm）
       </p>
     </section>
 
-    <!-- ============ 裁片标签 ============ -->
-    <section v-if="mode === 'labels'" v-for="(page, pi) in labelPages" :key="'lp' + pi" class="label-page">
-      <div class="label-grid">
+    <!-- ============ 裁片标签（每 10 张一页，一张不漏） ============ -->
+    <section
+      v-if="mode === 'labels'"
+      v-for="(page, pi) in labelPages"
+      :key="'lp' + pi"
+      class="label-page"
+      :style="{ width: pageDims.wMm + 'mm', minHeight: pageDims.hMm + 'mm' }"
+    >
+      <header class="lp-head">
+        <h1>蒙面裁片标签 · {{ lantern.name }}</h1>
+        <span>第 {{ pi + 1 }} / {{ labelPages.length }} 页 · 本页 {{ page.length }} 张 · 全单 {{ allPanels.length }} 张 · {{ opts.paper }}</span>
+      </header>
+      <div class="label-grid" :style="labelGridStyle">
         <div v-for="p in page" :key="p.id" class="label">
           <div class="lb-head">
             <span class="lb-code">{{ p.id }}</span>
@@ -635,9 +751,12 @@ function today(): string {
             </div>
             <div><span>对位标记</span><b>{{ p.marksMm.length }} 处（见 1:1 图十字编号）</b></div>
           </div>
+          <div class="lb-tags">
+            逐块编号：
+            <span v-for="k in p.qty" :key="k" class="lb-tag">{{ p.id }}-{{ String(k).padStart(2, '0') }}</span>
+          </div>
           <div class="lb-foot">
-            {{ lantern.name }} · 蒙面 {{ coveringLabel(lantern.covering) }} · 逐块编号
-            {{ p.id }}-01 … {{ p.id }}-{{ String(p.qty).padStart(2, '0') }}
+            {{ lantern.name }} · 蒙面 {{ coveringLabel(lantern.covering) }} · 标签号 {{ p.id }} 与裁片清单 / 1:1 图纸一致
           </div>
         </div>
       </div>
@@ -646,9 +765,9 @@ function today(): string {
     <ChecksPanel
       v-if="full && mode === 'loft'"
       class="no-print"
-      :checks="full.checks.filter((c) => ['CHK-05', 'CHK-06', 'CHK-08'].includes(c.id))"
+      :checks="full.checks.filter((c) => ['CHK-06', 'CHK-08', 'CHK-09', 'CHK-10', 'CHK-11', 'CHK-12'].includes(c.id))"
       :elapsed-ms="full.elapsedMs"
-      title="放样与分页自检"
+      title="放样、分页与编号自检"
     />
   </div>
 </template>
@@ -822,6 +941,89 @@ button.primary:hover {
   color: var(--red);
 }
 
+/* ---------- 编号对账单 ---------- */
+.reconcile {
+  background: var(--surface);
+  border: 1px solid var(--jade);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+
+.reconcile.bad {
+  border-color: var(--red);
+  background: #fdf3f1;
+}
+
+.reconcile header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.reconcile h3 {
+  margin: 0;
+  font-size: 13.5px;
+  color: #8f1c19;
+}
+
+.pill {
+  font-size: 11.5px;
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.pill.ok {
+  background: #e2f0ea;
+  color: var(--jade);
+}
+
+.pill.bad {
+  background: #fbe0dc;
+  color: var(--red);
+}
+
+.rec-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 5px 18px;
+  font-size: 12px;
+}
+
+.rec-grid div {
+  display: flex;
+  gap: 8px;
+}
+
+.rec-grid span {
+  color: var(--ink-soft);
+  flex: 0 0 92px;
+}
+
+.rec-grid b {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.rec-grid b.bad {
+  color: var(--red);
+}
+
+.rec-problems {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--red);
+  font-size: 12px;
+}
+
+.rec-ok {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--jade);
+}
+
 /* ---------- 图纸 ---------- */
 .sheets {
   display: flex;
@@ -927,6 +1129,10 @@ button.primary:hover {
   stroke-width: 0.3;
 }
 
+.strip-overlap {
+  fill: rgba(47, 122, 99, 0.32);
+}
+
 .strip-tick {
   stroke: #2f5f8a;
   stroke-width: 0.25;
@@ -992,8 +1198,6 @@ button.primary:hover {
 
 /* ---------- 构件清单 ---------- */
 .doc {
-  width: 210mm;
-  min-height: 297mm;
   padding: 14mm 12mm;
   background: #fff;
   border: 1px solid var(--line-strong);
@@ -1064,20 +1268,38 @@ button.primary:hover {
 
 /* ---------- 裁片标签 ---------- */
 .label-page {
-  width: 210mm;
-  height: 297mm;
   padding: 10mm;
   background: #fff;
   border: 1px solid var(--line-strong);
   box-shadow: var(--shadow);
   margin: 0 auto;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 4mm;
+}
+
+.lp-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  border-bottom: 0.3mm solid var(--line-strong);
+  padding-bottom: 2mm;
+}
+
+.lp-head h1 {
+  margin: 0;
+  font-size: 5mm;
+  color: #8f1c19;
+}
+
+.lp-head span {
+  font-size: 3mm;
+  color: var(--ink-soft);
 }
 
 .label-grid {
   display: grid;
-  grid-template-columns: repeat(2, 88mm);
-  grid-auto-rows: 50mm;
   gap: 4mm;
 }
 
@@ -1142,6 +1364,25 @@ button.primary:hover {
   font-weight: 500;
 }
 
+.lb-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1mm 2mm;
+  align-items: center;
+  font-size: 2.4mm;
+  color: var(--ink-soft);
+}
+
+.lb-tag {
+  font-family: var(--mono);
+  font-size: 2.5mm;
+  background: var(--surface-2);
+  border: 0.2mm solid var(--line-strong);
+  border-radius: 1mm;
+  padding: 0.2mm 1.4mm;
+  color: #8f1c19;
+}
+
 .lb-foot {
   margin-top: auto;
   font-size: 2.4mm;
@@ -1157,13 +1398,26 @@ button.primary:hover {
 
 /* ---------- 打印 ---------- */
 @media print {
+  /* @page 尺寸由 JS 按所选 A4/A3 动态注入；这里再锁根节点尺寸，避免任何缩放 */
+  html,
+  body {
+    width: auto;
+    height: auto;
+  }
+
   .print-view {
     gap: 0;
+    display: block;
+  }
+
+  .controls {
+    display: none !important;
   }
 
   .sheets {
     gap: 0;
     overflow: visible;
+    display: block;
   }
 
   .sheet,

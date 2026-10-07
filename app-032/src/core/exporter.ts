@@ -29,10 +29,11 @@ export function membersCsv(l: Lantern, members: FrameMember[]): string {
     [`花灯构件清单 · ${l.name}`],
     [`最大直径 ${l.maxDiameterMm}mm / 总高 ${l.totalHeightMm}mm / 绑扎余量 每端 ${l.lashAllowanceMm}mm / 生成 ${new Date().toLocaleString()}`],
     [],
-    ['构件名称', '类别', '分组', '净长(mm)', '截取长度(mm,含余量)', '余量处数', '数量', '总截取长度(mm)', '弯曲半径(mm)', '折角(°)', '备注']
+    ['构件编号', '构件名称', '类别', '分组', '净长(mm)', '截取长度(mm,含余量)', '余量处数', '数量', '总截取长度(mm)', '弯曲半径(mm)', '折角(°)', '备注']
   ]
   for (const m of members) {
     rows.push([
+      m.id,
       m.label,
       kindName(m.kind),
       m.group,

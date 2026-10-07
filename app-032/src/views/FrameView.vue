@@ -65,6 +65,7 @@ function exportCsv() {
       <table>
         <thead>
           <tr>
+            <th>构件编号</th>
             <th>构件名称</th>
             <th>类别</th>
             <th class="num">净长 (mm)</th>
@@ -78,6 +79,7 @@ function exportCsv() {
         </thead>
         <tbody>
           <tr v-for="m in grp.items" :key="m.id">
+            <td class="mono strong">{{ m.id }}</td>
             <td class="name">{{ m.label }}</td>
             <td>{{ kindName(m.kind) }}</td>
             <td class="num mono">{{ m.rawLengthMm.toFixed(1) }}</td>
@@ -93,7 +95,7 @@ function exportCsv() {
     </section>
 
     <ChecksPanel
-      :checks="full.checks.filter((c) => ['CHK-01', 'CHK-02', 'CHK-04', 'CHK-08'].includes(c.id))"
+      :checks="full.checks.filter((c) => ['CHK-01', 'CHK-02', 'CHK-04', 'CHK-09', 'CHK-10', 'CHK-08'].includes(c.id))"
       :elapsed-ms="full.elapsedMs"
       title="骨架计算自检"
     />

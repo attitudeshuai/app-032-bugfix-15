@@ -47,6 +47,20 @@ export function panelCutArea(p: Panel): number {
   return areaOf(p, true)
 }
 
+/**
+ * 裁片 1:1 外接矩形（含缝份，mm）。
+ * 梯形 / 三角形按实际顶点取外接框（不能只看上宽：下宽更大或多边形顶点外扩时会越界被切边）。
+ */
+export function panelCutBounds(p: Panel): { w: number; h: number } {
+  if (p.shape === 'circle' && p.polySides && p.polySides >= 3) {
+    // 正 n 边形外接圆直径 = 对边距 / cos(π/n)
+    return { w: p.widthTopMm / Math.cos(Math.PI / p.polySides), h: p.widthTopMm / Math.cos(Math.PI / p.polySides) }
+  }
+  if (p.shape === 'triangle') return { w: p.widthBottomMm, h: p.heightMm }
+  if (p.shape === 'circle') return { w: p.widthTopMm, h: p.widthTopMm }
+  return { w: Math.max(p.widthTopMm, p.widthBottomMm), h: p.heightMm }
+}
+
 export function panelNetArea(p: Panel): number {
   if (p.shape === 'circle' && p.polySides && p.polySides >= 3) {
     const a = p.rawWidthTopMm / 2
